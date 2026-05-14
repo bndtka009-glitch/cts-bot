@@ -1,0 +1,4 @@
+[build]
+
+[build.variables]
+RAILPACK_PYTHON_VERSION = "3.12"
