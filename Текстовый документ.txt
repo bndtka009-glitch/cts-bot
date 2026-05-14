@@ -1,0 +1,171 @@
+import asyncio
+import logging
+import sqlite3
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.filters import Command
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
+from aiogram.types import (
+    ReplyKeyboardMarkup, KeyboardButton, 
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardRemove
+)
+
+# ==========================================
+# КОНФИГУРАЦИЯ (ВСТАВЬ СВОИ ДАННЫЕ)
+# ==========================================
+BOT_TOKEN = "8643364597:AAE2o2zq4kNuKwVxxRzrRbiTfgI2TJXgwhs"
+ADMIN_ID =5967495207  # Твой цифровой ID
+
+# Настройка логов
+logging.basicConfig(level=logging.INFO)
+
+# ==========================================
+# БАЗА ДАННЫХ (SQLITE)
+# ==========================================
+class DataManager:
+    def __init__(self, db_path="startup_data.db"):
+        self.conn = sqlite3.connect(db_path)
+        self.cursor = self.conn.cursor()
+        self.init_tables()
+
+    def init_tables(self):
+        # Таблица пользователей
+        self.cursor.execute('''CREATE TABLE IF NOT EXISTS users 
+            (user_id INTEGER PRIMARY KEY, role TEXT, points INTEGER DEFAULT 0)''')
+        # Таблица репортов
+        self.cursor.execute('''CREATE TABLE IF NOT EXISTS reports 
+            (id INTEGER PRIMARY KEY AUTOINCREMENT, driver_id INTEGER, 
+             location TEXT, photo_id TEXT, status TEXT)''')
+        self.conn.commit()
+
+    def register_user(self, user_id, role):
+        self.cursor.execute("INSERT OR IGNORE INTO users (user_id, role) VALUES (?, ?)", (user_id, role))
+        self.conn.commit()
+
+    def get_user(self, user_id):
+        return self.cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
+
+    def create_report(self, driver_id, location, photo_id):
+        self.cursor.execute("INSERT INTO reports (driver_id, location, photo_id, status) VALUES (?, ?, ?, 'pending')", 
+                            (driver_id, location, photo_id))
+        self.conn.commit()
+        return self.cursor.lastrowid
+
+    def approve_report(self, report_id):
+        # Получаем ID водителя
+        driver_id = self.cursor.execute("SELECT driver_id FROM reports WHERE id = ?", (report_id,)).fetchone()[0]
+        # Обновляем статус и начисляем балл
+        self.cursor.execute("UPDATE reports SET status = 'approved' WHERE id = ?", (report_id,))
+        self.cursor.execute("UPDATE users SET points = points + 1 WHERE user_id = ?", (driver_id,))
+        self.conn.commit()
+        return driver_id
+
+db = DataManager()
+
+# ==========================================
+# МАШИНА СОСТОЯНИЙ (FSM)
+# ==========================================
+class Form(StatesGroup):
+    geo = State()
+    photo = State()
+
+# ==========================================
+# КЛАВИАТУРЫ
+# ==========================================
+def get_main_kb(role):
+    if role == 'admin':
+        return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📊 Статистика системы")]], resize_keyboard=True)
+    elif role == 'driver':
+        return ReplyKeyboardMarkup(keyboard=[
+            [KeyboardButton(text="🚨 Сообщить об инциденте", request_location=True)],
+            [KeyboardButton(text="🎁 Мои бонусы")]
+        ], resize_keyboard=True)
+    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🗺 Карта пробок")]], resize_keyboard=True)
+
+def get_admin_inline(report_id):
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"ok_{report_id}"),
+        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"no_{report_id}")
+    ]])
+
+# ==========================================
+# ОБРАБОТКА КОМАНД
+# ==========================================
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    user_id = message.from_user.id
+    # Присваиваем роль
+    role = 'admin' if user_id == ADMIN_ID else 'driver'
+    db.register_user(user_id, role)
+    
+    await message.answer(
+        f"👋 Система Driver Network активна!\nВаша роль: **{role.upper()}**",
+        reply_markup=get_main_kb(role), parse_mode="Markdown"
+    )
+
+# --- ЛОГИКА ВОДИТЕЛЯ (РЕПОРТ) ---
+
+@dp.message(F.location)
+async def handle_location(message: types.Message, state: FSMContext):
+    coords = f"{message.location.latitude}, {message.location.longitude}"
+    await state.update_data(geo=coords)
+    await message.answer("📸 Теперь отправьте фото происшествия для подтверждения.", reply_markup=ReplyKeyboardRemove())
+    await state.set_state(Form.photo)
+
+@dp.message(Form.photo, F.photo)
+async def handle_photo(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    photo_id = message.photo[-1].file_id
+    report_id = db.create_report(message.from_user.id, data['geo'], photo_id)
+    
+    await message.answer("✅ Отчет отправлен админу. Спасибо за помощь!", reply_markup=get_main_kb('driver'))
+    
+    # Отправляем админу
+    await bot.send_photo(
+        ADMIN_ID, photo=photo_id,
+        caption=f"🔎 Новый инцидент #{report_id}\n📍 Координаты: {data['geo']}",
+        reply_markup=get_admin_inline(report_id)
+    )
+    await state.clear()
+
+@dp.message(F.text == "🎁 Мои бонусы")
+async def show_points(message: types.Message):
+    user = db.get_user(message.from_user.id)
+    pts = user[2]
+    # Логика стартапа: 4 репорта = 1 день отдыха
+    days = pts // 4
+    left = 4 - (pts % 4)
+    
+    text = f"⭐ Ваши баллы: **{pts}**\n📅 Накоплено дней отдыха: **{days}**\n\n"
+    if left > 0:
+        text += f"До следующего дня отдыха осталось подтвердить еще **{left}** инцидента."
+    
+    await message.answer(text, parse_mode="Markdown")
+
+# --- ЛОГИКА АДМИНА ---
+
+@dp.callback_query(F.data.startswith("ok_"))
+async def approve(callback: types.CallbackQuery):
+    report_id = callback.data.split("_")[1]
+    driver_id = db.approve_report(report_id)
+    
+    await callback.message.edit_caption(caption="✅ Инцидент подтвержден. Балл начислен водителю.")
+    await bot.send_message(driver_id, "🌟 Ваш отчет подтвержден! Вам начислен 1 балл.")
+
+@dp.callback_query(F.data.startswith("no_"))
+async def reject(callback: types.CallbackQuery):
+    await callback.message.edit_caption(caption="❌ Отчет отклонен (недостаточно доказательств).")
+
+# ==========================================
+# ЗАПУСК
+# ==========================================
+async def main():
+    print("Бот запущен. Нажмите Ctrl+C для остановки.")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
