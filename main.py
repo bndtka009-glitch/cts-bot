@@ -11,9 +11,6 @@ from aiogram.types import (
     ReplyKeyboardRemove, WebAppInfo
 )
 
-# ==========================================
-# КОНФИГУРАЦИЯ
-# ==========================================
 BOT_TOKEN = "8643364597:AAE2o2zq4kNuKwVxxRzrRbiTfgI2TJXgwhs"
 SUPER_ADMIN_ID = 5967495207
 
@@ -24,522 +21,553 @@ logging.basicConfig(level=logging.INFO)
 # ==========================================
 class CTSDatabase:
     def __init__(self, db_path="cts_infrastructure.db"):
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.conn = sqlite3.connect(db_path)
         self.cursor = self.conn.cursor()
         self.init_tables()
 
     def init_tables(self):
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS users (
-                user_id  INTEGER PRIMARY KEY,
-                role     TEXT    NOT NULL,
-                emp_id   TEXT    UNIQUE,
-                points   INTEGER DEFAULT 0
-            )
-        ''')
+                user_id   INTEGER PRIMARY KEY,
+                role      TEXT,
+                status    TEXT DEFAULT 'pending',
+                full_name TEXT,
+                points    INTEGER DEFAULT 0
+            )''')
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS reports (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                driver_id INTEGER,
+                location  TEXT,
+                photo_id  TEXT,
+                status    TEXT
+            )''')
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS drone_audits (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                driver_id   INTEGER NOT NULL,
                 location    TEXT,
-                photo_id    TEXT,
-                drone_req   INTEGER DEFAULT 0,
-                status      TEXT    DEFAULT 'pending',
-                reject_reason TEXT
-            )
-        ''')
+                requested_by INTEGER,
+                status      TEXT DEFAULT 'pending'
+            )''')
         self.conn.commit()
 
-    # ---------- пользователи ----------
-    def upsert_user(self, user_id: int, role: str):
+    def get_user(self, user_id):
+        return self.cursor.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
+
+    def register_user(self, user_id, full_name, role):
         self.cursor.execute(
-            "INSERT OR IGNORE INTO users (user_id, role) VALUES (?, ?)",
-            (user_id, role)
-        )
+            "INSERT OR IGNORE INTO users (user_id, full_name, role, status) VALUES (?,?,?,'pending')",
+            (user_id, full_name, role))
         self.conn.commit()
 
-    def get_user(self, user_id: int):
+    def approve_user(self, user_id):
+        self.cursor.execute("UPDATE users SET status='approved' WHERE user_id=?", (user_id,))
+        self.conn.commit()
+
+    def reject_user(self, user_id):
+        self.cursor.execute("UPDATE users SET status='rejected' WHERE user_id=?", (user_id,))
+        self.conn.commit()
+
+    def bind_superadmin(self, user_id):
+        self.cursor.execute(
+            "INSERT OR REPLACE INTO users (user_id, role, status, full_name) VALUES (?,'admin','approved','SuperAdmin')",
+            (user_id,))
+        self.conn.commit()
+
+    def get_pending_users(self):
         return self.cursor.execute(
-            "SELECT user_id, role, emp_id, points FROM users WHERE user_id = ?",
-            (user_id,)
-        ).fetchone()
+            "SELECT user_id, full_name, role FROM users WHERE status='pending'").fetchall()
 
-    def set_emp_id(self, user_id: int, emp_id: str):
-        self.cursor.execute(
-            "UPDATE users SET emp_id = ? WHERE user_id = ?",
-            (emp_id, user_id)
-        )
-        self.conn.commit()
+    def get_all_users(self):
+        return self.cursor.execute(
+            "SELECT user_id, full_name, role, status, points FROM users ORDER BY points DESC").fetchall()
 
     def get_all_drivers(self):
         return self.cursor.execute(
-            "SELECT user_id FROM users WHERE role = 'driver'"
-        ).fetchall()
+            "SELECT user_id FROM users WHERE role='driver' AND status='approved'").fetchall()
 
-    def get_all_passengers(self):
+    def get_all_approved(self):
         return self.cursor.execute(
-            "SELECT user_id FROM users WHERE role = 'passenger'"
-        ).fetchall()
+            "SELECT user_id FROM users WHERE status='approved'").fetchall()
 
-    # ---------- репорты ----------
-    def create_report(self, driver_id: int, location: str, photo_id: str, drone_req: int = 0):
+    def adjust_points(self, user_id, delta):
         self.cursor.execute(
-            "INSERT INTO reports (driver_id, location, photo_id, drone_req) VALUES (?, ?, ?, ?)",
-            (driver_id, location, photo_id, drone_req)
-        )
+            "UPDATE users SET points = MAX(0, points + ?) WHERE user_id=?", (delta, user_id))
+        self.conn.commit()
+
+    def create_report(self, driver_id, location, photo_id):
+        self.cursor.execute(
+            "INSERT INTO reports (driver_id, location, photo_id, status) VALUES (?,?,?,'pending')",
+            (driver_id, location, photo_id))
         self.conn.commit()
         return self.cursor.lastrowid
 
+    def update_report_status(self, report_id, status):
+        self.cursor.execute("UPDATE reports SET status=? WHERE id=?", (status, report_id))
+        if status == 'approved':
+            res = self.cursor.execute("SELECT driver_id FROM reports WHERE id=?", (report_id,)).fetchone()
+            if res:
+                self.cursor.execute("UPDATE users SET points=points+1 WHERE user_id=?", (res[0],))
+        self.conn.commit()
+
     def get_pending_reports(self):
-        return self.cursor.execute(
-            "SELECT id, driver_id, location, photo_id, drone_req FROM reports WHERE status = 'pending'"
-        ).fetchall()
-
-    def get_driver_reports(self, driver_id: int):
-        return self.cursor.execute(
-            "SELECT id, location, status, drone_req FROM reports WHERE driver_id = ? ORDER BY id DESC LIMIT 10",
-            (driver_id,)
-        ).fetchall()
-
-    def approve_report(self, report_id: int):
-        self.cursor.execute(
-            "UPDATE reports SET status = 'approved' WHERE id = ?",
-            (report_id,)
-        )
-        res = self.cursor.execute(
-            "SELECT driver_id FROM reports WHERE id = ?",
-            (report_id,)
-        ).fetchone()
-        if res:
-            self.cursor.execute(
-                "UPDATE users SET points = points + 1 WHERE user_id = ?",
-                (res[0],)
-            )
-        self.conn.commit()
-        return res[0] if res else None
-
-    def reject_report(self, report_id: int, reason: str):
-        self.cursor.execute(
-            "UPDATE reports SET status = 'rejected', reject_reason = ? WHERE id = ?",
-            (reason, report_id)
-        )
-        res = self.cursor.execute(
-            "SELECT driver_id FROM reports WHERE id = ?",
-            (report_id,)
-        ).fetchone()
-        self.conn.commit()
-        return res[0] if res else None
+        return self.cursor.execute("SELECT * FROM reports WHERE status='pending'").fetchall()
 
     def get_stats(self):
         total   = self.cursor.execute("SELECT COUNT(*) FROM reports").fetchone()[0]
-        pending = self.cursor.execute("SELECT COUNT(*) FROM reports WHERE status='pending'").fetchone()[0]
         approved= self.cursor.execute("SELECT COUNT(*) FROM reports WHERE status='approved'").fetchone()[0]
-        drivers = self.cursor.execute("SELECT COUNT(*) FROM users WHERE role='driver'").fetchone()[0]
-        return total, pending, approved, drivers
+        rejected= self.cursor.execute("SELECT COUNT(*) FROM reports WHERE status='rejected'").fetchone()[0]
+        pending = self.cursor.execute("SELECT COUNT(*) FROM reports WHERE status='pending'").fetchone()[0]
+        users   = self.cursor.execute("SELECT COUNT(*) FROM users WHERE status='approved'").fetchone()[0]
+        top     = self.cursor.execute(
+            "SELECT full_name, points FROM users WHERE role='driver' AND status='approved' ORDER BY points DESC LIMIT 5"
+        ).fetchall()
+        return total, approved, rejected, pending, users, top
 
+    def create_drone_audit(self, location, requested_by):
+        self.cursor.execute(
+            "INSERT INTO drone_audits (location, requested_by, status) VALUES (?,?,'pending')",
+            (location, requested_by))
+        self.conn.commit()
+        return self.cursor.lastrowid
 
 db = CTSDatabase()
-# Гарантируем запись суперадмина при старте
-db.upsert_user(SUPER_ADMIN_ID, 'admin')
 
 # ==========================================
-# МАШИНА СОСТОЯНИЙ
+# FSM
 # ==========================================
+class RegisterState(StatesGroup):
+    role = State()
+
 class ReportState(StatesGroup):
-    photo = State()
+    location = State()
+    photo    = State()
 
-class DroneState(StatesGroup):
-    description = State()
-
-class RejectState(StatesGroup):
-    reason = State()
-    report_id = State()
+class AdminReportState(StatesGroup):
+    location = State()
+    photo    = State()
 
 class BroadcastState(StatesGroup):
     text = State()
 
-class EmpIdState(StatesGroup):
-    waiting = State()
+class DroneState(StatesGroup):
+    location = State()
+
+class AdjustPointsState(StatesGroup):
+    user_id = State()
+    delta   = State()
 
 # ==========================================
 # КЛАВИАТУРЫ
 # ==========================================
-def kb_admin():
+def get_superadmin_kb():
     return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="📋 Репорты на проверку"), KeyboardButton(text="📊 Статистика")],
-        [KeyboardButton(text="📢 Рассылка водителям"),  KeyboardButton(text="📣 Рассылка пассажирам")],
-        [KeyboardButton(text="🗺 Карта Астаны",
+        [KeyboardButton(text="📊 Статистика системы"),   KeyboardButton(text="📋 Проверить репорты")],
+        [KeyboardButton(text="➕ Создать репорт"),        KeyboardButton(text="👥 Заявки на регистрацию")],
+        [KeyboardButton(text="👤 Все пользователи"),      KeyboardButton(text="✏️ Изменить баллы")],
+        [KeyboardButton(text="📢 Рассылка"),              KeyboardButton(text="🚁 Дрон-аудит")],
+        [KeyboardButton(text="🎁 Мои бонусы"),
+         KeyboardButton(text="🗺 Карта",
                         web_app=WebAppInfo(url="https://yandex.kz/maps/163/astana/"))]
     ], resize_keyboard=True)
 
-def kb_driver():
+def get_driver_kb():
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="🚨 Сообщить об инциденте")],
-        [KeyboardButton(text="🚁 Запросить дрон-аудит")],
-        [KeyboardButton(text="📜 Мои репорты"), KeyboardButton(text="🎁 Мои бонусы")],
-        [KeyboardButton(text="🗺 Карта Астаны",
-                        web_app=WebAppInfo(url="https://yandex.kz/maps/163/astana/"))]
+        [KeyboardButton(text="🎁 Мои бонусы")]
     ], resize_keyboard=True)
 
-def kb_passenger():
+def get_passenger_kb():
     return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="🚌 Статус маршрутов")],
-        [KeyboardButton(text="🗺 Карта Астаны",
+        [KeyboardButton(text="🗺 Карта пробок",
                         web_app=WebAppInfo(url="https://yandex.kz/maps/163/astana/"))]
     ], resize_keyboard=True)
 
-def kb_report_actions(report_id: int):
+def get_role_kb():
+    return ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="🚌 Я водитель")],
+        [KeyboardButton(text="👤 Я пассажир")]
+    ], resize_keyboard=True, one_time_keyboard=True)
+
+def get_cancel_kb():
+    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Отмена")]],
+                               resize_keyboard=True)
+
+def user_approve_kb(user_id):
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Одобрить",  callback_data=f"adm_ok_{report_id}"),
-        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"adm_no_{report_id}")
+        InlineKeyboardButton(text="✅ Одобрить", callback_data=f"usr_ok_{user_id}"),
+        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"usr_no_{user_id}")
     ]])
 
-def kb_role_select():
-    return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="🚌 Я — водитель")],
-        [KeyboardButton(text="👤 Я — пассажир")]
-    ], resize_keyboard=True)
+def role_kb(role):
+    if role == 'admin':   return get_superadmin_kb()
+    if role == 'driver':  return get_driver_kb()
+    return get_passenger_kb()
 
-# ==========================================
-# BOT + DISPATCHER
-# ==========================================
+def is_admin(uid): return uid == SUPER_ADMIN_ID
+
 bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher()
+
+# ==========================================
+# CANCEL — универсальная отмена FSM
+# ==========================================
+@dp.message(F.text == "❌ Отмена")
+async def cancel_any(message: types.Message, state: FSMContext):
+    await state.clear()
+    kb = get_superadmin_kb() if is_admin(message.from_user.id) else get_driver_kb()
+    await message.answer("↩️ Отменено.", reply_markup=kb)
 
 # ==========================================
 # /start
 # ==========================================
 @dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    user_id = message.from_user.id
-
-    if user_id == SUPER_ADMIN_ID:
-        db.upsert_user(user_id, 'admin')
-        await message.answer(
-            "👑 *SUPERADMIN ACTIVATED*\nДобро пожаловать в CTS Driver Network.",
-            reply_markup=kb_admin(), parse_mode="Markdown"
-        )
+async def cmd_start(message: types.Message, state: FSMContext):
+    uid = message.from_user.id
+    if is_admin(uid):
+        db.bind_superadmin(uid)
+        await message.answer("👑 *SUPERADMIN ACTIVATED*\nДобро пожаловать в CTS.",
+                             reply_markup=get_superadmin_kb(), parse_mode="Markdown")
         return
 
-    user = db.get_user(user_id)
-    if user:
-        role = user[1]
-        kb   = kb_driver() if role == 'driver' else kb_passenger()
-        await message.answer(f"👋 С возвращением! Ваша роль: *{role.upper()}*",
-                             reply_markup=kb, parse_mode="Markdown")
+    user = db.get_user(uid)
+    if user and user[2] == 'approved':
+        await message.answer(f"👋 С возвращением! Роль: *{user[1].upper()}*",
+                             reply_markup=role_kb(user[1]), parse_mode="Markdown")
+        return
+    if user and user[2] == 'pending':
+        await message.answer("⏳ Заявка уже отправлена. Ожидайте одобрения."); return
+    if user and user[2] == 'rejected':
+        await message.answer("❌ Заявка отклонена. Обратитесь к администратору."); return
+
+    await message.answer("👋 Добро пожаловать в CTS!\n\nВыберите вашу роль:",
+                         reply_markup=get_role_kb())
+    await state.set_state(RegisterState.role)
+
+# ==========================================
+# РЕГИСТРАЦИЯ
+# ==========================================
+@dp.message(RegisterState.role, F.text.in_(["🚌 Я водитель", "👤 Я пассажир"]))
+async def process_role(message: types.Message, state: FSMContext):
+    role = "driver" if "водитель" in message.text else "passenger"
+    uid  = message.from_user.id
+    name = message.from_user.full_name
+    db.register_user(uid, name, role)
+    await message.answer("✅ Заявка отправлена! Ожидайте одобрения.", reply_markup=ReplyKeyboardRemove())
+    await state.clear()
+    label = "Водитель 🚌" if role == "driver" else "Пассажир 👤"
+    await bot.send_message(SUPER_ADMIN_ID,
+        f"🔔 *Новая заявка*\n👤 {name}\n🆔 `{uid}`\n🎭 {label}",
+        reply_markup=user_approve_kb(uid), parse_mode="Markdown")
+
+# ==========================================
+# СУПЕРАДМИН: одобрение пользователей
+# ==========================================
+@dp.message(F.text == "👥 Заявки на регистрацию")
+async def show_pending_users(message: types.Message):
+    if not is_admin(message.from_user.id): return
+    rows = db.get_pending_users()
+    if not rows:
+        await message.answer("✅ Новых заявок нет."); return
+    for uid, name, role in rows:
+        label = "Водитель 🚌" if role == "driver" else "Пассажир 👤"
+        await message.answer(f"👤 *{name}*\n🆔 `{uid}`\n🎭 {label}",
+                             reply_markup=user_approve_kb(uid), parse_mode="Markdown")
+
+@dp.callback_query(F.data.startswith("usr_"))
+async def handle_user_decision(callback: types.CallbackQuery):
+    _, decision, uid_str = callback.data.split("_")
+    uid  = int(uid_str)
+    user = db.get_user(uid)
+    name = user[3] if user else str(uid)
+    role = user[1] if user else "passenger"
+    label = "Водитель 🚌" if role == "driver" else "Пассажир 👤"
+    if decision == "ok":
+        db.approve_user(uid)
+        await callback.message.edit_text(f"✅ *{name}* одобрен как {label}", parse_mode="Markdown")
+        kb = get_driver_kb() if role == "driver" else get_passenger_kb()
+        await bot.send_message(uid, f"🎉 Заявка одобрена! Роль: *{label}*",
+                               reply_markup=kb, parse_mode="Markdown")
     else:
-        await message.answer(
-            "👋 Добро пожаловать в *CTS Driver Network*!\nВыберите вашу роль:",
-            reply_markup=kb_role_select(), parse_mode="Markdown"
-        )
-
-@dp.message(F.text == "🚌 Я — водитель")
-async def reg_driver(message: types.Message, state: FSMContext):
-    db.upsert_user(message.from_user.id, 'driver')
-    await message.answer(
-        "✅ Вы зарегистрированы как *водитель*.\n\n"
-        "Пожалуйста, введите ваш табельный номер (Employee ID) для привязки:",
-        reply_markup=ReplyKeyboardRemove(), parse_mode="Markdown"
-    )
-    await state.set_state(EmpIdState.waiting)
-
-@dp.message(F.text == "👤 Я — пассажир")
-async def reg_passenger(message: types.Message):
-    db.upsert_user(message.from_user.id, 'passenger')
-    await message.answer(
-        "✅ Вы зарегистрированы как *пассажир*.\n"
-        "Вы будете получать оповещения о ситуации на маршрутах.",
-        reply_markup=kb_passenger(), parse_mode="Markdown"
-    )
-
-@dp.message(EmpIdState.waiting)
-async def save_emp_id(message: types.Message, state: FSMContext):
-    emp_id = message.text.strip()
-    db.set_emp_id(message.from_user.id, emp_id)
-    await state.clear()
-    await message.answer(
-        f"✅ Табельный номер *{emp_id}* сохранён.\nДобро пожаловать в систему!",
-        reply_markup=kb_driver(), parse_mode="Markdown"
-    )
+        db.reject_user(uid)
+        await callback.message.edit_text(f"❌ *{name}* отклонён.", parse_mode="Markdown")
+        await bot.send_message(uid, "❌ Ваша заявка отклонена. Обратитесь к администратору.")
+    await callback.answer()
 
 # ==========================================
-# ВОДИТЕЛЬ — репорт
+# СУПЕРАДМИН: все пользователи
 # ==========================================
-@dp.message(F.text == "🚨 Сообщить об инциденте")
-async def driver_report(message: types.Message, state: FSMContext):
-    user = db.get_user(message.from_user.id)
-    if not user or user[1] != 'driver':
-        await message.answer("⛔ Только водители могут отправлять репорты.")
-        return
-    await state.update_data(drone_req=0)
-    await message.answer(
-        "📸 Отправьте *фото инцидента* с подписью-описанием (необязательно).\n"
-        "Геолокация будет взята автоматически из метаданных.",
-        reply_markup=ReplyKeyboardRemove(), parse_mode="Markdown"
-    )
-    await state.set_state(ReportState.photo)
-
-@dp.message(F.text == "🚁 Запросить дрон-аудит")
-async def drone_request(message: types.Message, state: FSMContext):
-    user = db.get_user(message.from_user.id)
-    if not user or user[1] != 'driver':
-        await message.answer("⛔ Только водители могут запрашивать дрон-аудит.")
-        return
-    await state.update_data(drone_req=1)
-    await message.answer(
-        "🚁 *Дрон-аудит запрошен.*\n\n"
-        "Отправьте фото места (или любое фото-заглушку) и кратко опишите ситуацию в подписи к фото.\n"
-        "Администратор получит запрос на выезд дрона.",
-        reply_markup=ReplyKeyboardRemove(), parse_mode="Markdown"
-    )
-    await state.set_state(ReportState.photo)
-
-@dp.message(ReportState.photo, F.photo)
-async def process_photo(message: types.Message, state: FSMContext):
-    data     = await state.get_data()
-    drone_req = data.get('drone_req', 0)
-    photo_id  = message.photo[-1].file_id
-    caption   = message.caption or ""
-
-    # Координаты из геолокации или дефолт (Байтерек)
-    location = "51.1283, 71.4305"
-
-    report_id = db.create_report(message.from_user.id, location, photo_id, drone_req)
-    await state.clear()
-
-    drone_label = " 🚁 [ДРОН-АУДИТ]" if drone_req else ""
-    await message.answer(
-        f"✅ Репорт *#{report_id}* отправлен{drone_label}. Ожидайте проверки.",
-        reply_markup=kb_driver(), parse_mode="Markdown"
-    )
-
-    # Уведомление админу
-    flag = "🚁 *ДРОН-АУДИТ ЗАПРОШЕН*\n\n" if drone_req else ""
-    admin_caption = (
-        f"{flag}📦 Новый репорт *#{report_id}*\n"
-        f"👤 Водитель: `{message.from_user.id}`\n"
-        f"📍 Локация: `{location}`\n"
-        f"📝 Описание: {caption if caption else '—'}"
-    )
-    await bot.send_photo(
-        SUPER_ADMIN_ID, photo=photo_id,
-        caption=admin_caption,
-        reply_markup=kb_report_actions(report_id),
-        parse_mode="Markdown"
-    )
-
-# БАГ-ФИК: обработка не-фото в состоянии ReportState.photo
-@dp.message(ReportState.photo)
-async def photo_wrong_input(message: types.Message):
-    await message.answer("⚠️ Пожалуйста, отправьте именно *фото*. Текст и файлы не принимаются.",
-                         parse_mode="Markdown")
-
-# ==========================================
-# ВОДИТЕЛЬ — история и бонусы
-# ==========================================
-@dp.message(F.text == "📜 Мои репорты")
-async def my_reports(message: types.Message):
-    user = db.get_user(message.from_user.id)
-    if not user or user[1] != 'driver':
-        await message.answer("⛔ Только для водителей.")
-        return
-    reports = db.get_driver_reports(message.from_user.id)
-    if not reports:
-        await message.answer("📭 У вас пока нет репортов.")
-        return
-    status_icon = {'pending': '⏳', 'approved': '✅', 'rejected': '❌'}
-    lines = ["📜 *Ваши последние репорты:*\n"]
-    for r in reports:
-        icon  = status_icon.get(r[2], '❓')
-        drone = " 🚁" if r[3] else ""
-        lines.append(f"{icon} Репорт *#{r[0]}*{drone}\n   📍 {r[1]}  |  статус: {r[2]}")
+@dp.message(F.text == "👤 Все пользователи")
+async def show_all_users(message: types.Message):
+    if not is_admin(message.from_user.id): return
+    rows = db.get_all_users()
+    if not rows:
+        await message.answer("База пользователей пуста."); return
+    status_icon = {'approved': '✅', 'pending': '⏳', 'rejected': '❌'}
+    role_icon   = {'admin': '👑', 'driver': '🚌', 'passenger': '👤'}
+    lines = ["*👥 Все пользователи:*\n"]
+    for uid, name, role, status, points in rows:
+        si = status_icon.get(status, '❓')
+        ri = role_icon.get(role, '❓')
+        lines.append(f"{si}{ri} *{name or uid}* — ⭐{points} баллов")
     await message.answer("\n".join(lines), parse_mode="Markdown")
 
-@dp.message(F.text == "🎁 Мои бонусы")
-async def check_bonus(message: types.Message):
-    user = db.get_user(message.from_user.id)
-    # БАГ-ФИКС: безопасная обработка если пользователь не в БД
-    pts  = user[3] if user else 0
-    days = pts // 4
-    left = 4 - (pts % 4)
+# ==========================================
+# СУПЕРАДМИН: изменить баллы
+# ==========================================
+@dp.message(F.text == "✏️ Изменить баллы")
+async def adjust_points_start(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id): return
+    rows = db.get_all_users()
+    lines = ["*Выберите пользователя — введите его ID:*\n"]
+    for uid, name, role, status, points in rows:
+        if status == 'approved':
+            lines.append(f"🆔 `{uid}` — {name} ({role}) ⭐{points}")
+    await message.answer("\n".join(lines), reply_markup=get_cancel_kb(), parse_mode="Markdown")
+    await state.set_state(AdjustPointsState.user_id)
+
+@dp.message(AdjustPointsState.user_id, F.text)
+async def adjust_points_get_id(message: types.Message, state: FSMContext):
+    try:
+        uid = int(message.text.strip())
+        user = db.get_user(uid)
+        if not user:
+            await message.answer("❌ Пользователь не найден. Попробуйте ещё раз."); return
+        await state.update_data(target_uid=uid, target_name=user[3])
+        await message.answer(
+            f"👤 *{user[3]}* — текущие баллы: ⭐{user[4]}\n\n"
+            f"Введите число для изменения баллов:\n"
+            f"• `+3` — начислить 3 балла\n"
+            f"• `-2` — снять 2 балла",
+            parse_mode="Markdown")
+        await state.set_state(AdjustPointsState.delta)
+    except ValueError:
+        await message.answer("⚠️ Введите числовой ID.")
+
+@dp.message(AdjustPointsState.delta, F.text)
+async def adjust_points_apply(message: types.Message, state: FSMContext):
+    try:
+        delta = int(message.text.strip().replace("+", ""))
+        data  = await state.get_data()
+        uid   = data["target_uid"]
+        name  = data["target_name"]
+        db.adjust_points(uid, delta)
+        user  = db.get_user(uid)
+        sign  = "+" if delta >= 0 else ""
+        await message.answer(
+            f"✅ Баллы изменены!\n👤 *{name}*\n{sign}{delta} → итого ⭐{user[4]}",
+            reply_markup=get_superadmin_kb(), parse_mode="Markdown")
+        await bot.send_message(uid,
+            f"📊 Ваш баланс обновлён администратором: {sign}{delta} балл(ов).\n"
+            f"Текущий баланс: ⭐{user[4]}")
+        await state.clear()
+    except ValueError:
+        await message.answer("⚠️ Введите число, например: +2 или -1")
+
+# ==========================================
+# СУПЕРАДМИН: статистика системы
+# ==========================================
+@dp.message(F.text == "📊 Статистика системы")
+async def show_full_stats(message: types.Message):
+    if not is_admin(message.from_user.id): return
+    total, approved, rejected, pending, users, top = db.get_stats()
+    top_lines = "\n".join([f"  {i+1}. {n or '?'} — ⭐{p}" for i, (n, p) in enumerate(top)]) or "  —"
     text = (
-        f"⭐ Ваши баллы: *{pts}*\n"
-        f"📅 Накоплено дней отдыха: *{days}*\n\n"
+        f"📈 *Статистика CTS*\n\n"
+        f"👥 Активных пользователей: *{users}*\n\n"
+        f"📦 Репортов всего: *{total}*\n"
+        f"  ✅ Одобрено: *{approved}*\n"
+        f"  ❌ Отклонено: *{rejected}*\n"
+        f"  ⏳ На проверке: *{pending}*\n\n"
+        f"🏆 Топ водителей:\n{top_lines}"
     )
-    if left < 4:
-        text += f"До следующего дня отдыха осталось: *{left}* подтверждённых репорта."
-    else:
-        text += "Подтверждайте инциденты — 4 балла = 1 день оплачиваемого отгула!"
     await message.answer(text, parse_mode="Markdown")
 
 # ==========================================
-# ПАССАЖИР
+# СУПЕРАДМИН: проверить репорты
 # ==========================================
-@dp.message(F.text == "🚌 Статус маршрутов")
-async def route_status(message: types.Message):
-    approved_count = db.cursor.execute(
-        "SELECT COUNT(*) FROM reports WHERE status='approved'"
-    ).fetchone()[0]
-    await message.answer(
-        f"🚌 *Статус маршрутов Астаны*\n\n"
-        f"✅ Обработано инцидентов сегодня: *{approved_count}*\n"
-        f"ℹ️ Актуальные оповещения появятся здесь после публикации администратором.",
-        parse_mode="Markdown"
-    )
-
-# ==========================================
-# АДМИН — проверка репортов
-# ==========================================
-@dp.message(F.text == "📋 Репорты на проверку")
-async def show_pending(message: types.Message):
-    if message.from_user.id != SUPER_ADMIN_ID:
-        return
+@dp.message(F.text == "📋 Проверить репорты")
+async def show_pending_reports(message: types.Message):
+    if not is_admin(message.from_user.id): return
     pending = db.get_pending_reports()
     if not pending:
-        await message.answer("✅ Новых репортов нет.")
-        return
-    await message.answer(f"📋 Ожидают проверки: *{len(pending)}* репорт(ов)", parse_mode="Markdown")
+        await message.answer("✅ Новых репортов нет."); return
     for r in pending:
-        rid, driver_id, location, photo_id, drone_req = r
-        drone_label = "🚁 *ДРОН-АУДИТ*\n" if drone_req else ""
-        caption = (
-            f"{drone_label}📦 Репорт *#{rid}*\n"
-            f"👤 Водитель: `{driver_id}`\n"
-            f"📍 Локация: `{location}`"
-        )
-        await bot.send_photo(
-            message.chat.id, photo=photo_id,
-            caption=caption,
-            reply_markup=kb_report_actions(rid),
-            parse_mode="Markdown"
-        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Одобрить", callback_data=f"adm_ok_{r[0]}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"adm_no_{r[0]}")
+        ]])
+        await bot.send_photo(message.chat.id, photo=r[3],
+                             caption=f"📦 Репорт #{r[0]}\n📍 {r[2]}\n👤 Driver ID: {r[1]}",
+                             reply_markup=kb)
 
-@dp.message(F.text == "📊 Статистика")
-async def show_stats(message: types.Message):
-    if message.from_user.id != SUPER_ADMIN_ID:
-        return
-    total, pending, approved, drivers = db.get_stats()
-    await message.answer(
-        f"📊 *Статистика CTS Driver Network*\n\n"
-        f"👷 Водителей в системе: *{drivers}*\n"
-        f"📦 Всего репортов: *{total}*\n"
-        f"⏳ Ожидают проверки: *{pending}*\n"
-        f"✅ Подтверждено: *{approved}*",
-        parse_mode="Markdown"
-    )
-
-# БАГ-ФИКС: callback_data "adm_ok_5" → split даёт ["adm","ok","5"]
-# Используем int(r_id) чтобы не было проблем с типами
-@dp.callback_query(F.data.startswith("adm_ok_"))
-async def admin_approve(callback: types.CallbackQuery):
-    r_id      = int(callback.data.split("adm_ok_")[1])
-    driver_id = db.approve_report(r_id)
-    await callback.message.edit_caption(
-        caption=f"✅ Репорт *#{r_id}* — ОДОБРЕН. Балл начислен водителю.",
-        parse_mode="Markdown"
-    )
-    await callback.answer("✅ Одобрено")
-    if driver_id:
-        user  = db.get_user(driver_id)
-        pts   = user[3] if user else 0
-        await bot.send_message(
-            driver_id,
-            f"🌟 Ваш репорт *#{r_id}* подтверждён!\n"
-            f"Вам начислен *1 балл*. Итого баллов: *{pts}*\n"
-            f"📅 Накоплено дней отдыха: *{pts // 4}*",
-            parse_mode="Markdown"
-        )
-
-@dp.callback_query(F.data.startswith("adm_no_"))
-async def admin_reject_start(callback: types.CallbackQuery, state: FSMContext):
-    r_id = int(callback.data.split("adm_no_")[1])
-    await state.update_data(report_id=r_id)
-    await state.set_state(RejectState.reason)
-    await callback.message.answer(
-        f"❌ Укажите причину отклонения репорта *#{r_id}*:",
-        parse_mode="Markdown"
-    )
+@dp.callback_query(F.data.startswith("adm_"))
+async def admin_report_decision(callback: types.CallbackQuery):
+    _, decision, r_id = callback.data.split("_")
+    status = "approved" if decision == "ok" else "rejected"
+    db.update_report_status(r_id, status)
+    icon = "✅" if status == "approved" else "❌"
+    await callback.message.edit_caption(caption=f"{icon} Репорт #{r_id}: {status.upper()}")
+    # Уведомить водителя
+    res = db.cursor.execute("SELECT driver_id FROM reports WHERE id=?", (r_id,)).fetchone()
+    if res and status == "approved":
+        user = db.get_user(res[0])
+        pts  = user[4] if user else "?"
+        await bot.send_message(res[0],
+            f"🌟 Репорт #{r_id} подтверждён! +1 балл.\nВаш баланс: ⭐{pts}")
+    elif res and status == "rejected":
+        await bot.send_message(res[0], f"❌ Репорт #{r_id} отклонён (недостаточно доказательств).")
     await callback.answer()
 
-@dp.message(RejectState.reason)
-async def admin_reject_finish(message: types.Message, state: FSMContext):
-    data      = await state.get_data()
-    r_id      = data['report_id']
-    reason    = message.text.strip()
-    driver_id = db.reject_report(r_id, reason)
+# ==========================================
+# СУПЕРАДМИН: создать репорт вручную
+# ==========================================
+@dp.message(F.text == "➕ Создать репорт")
+async def admin_create_report(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id): return
+    await message.answer(
+        "📍 Введите локацию инцидента.\n"
+        "Координаты (напр. <code>51.1283, 71.4305</code>) или описание места.",
+        reply_markup=get_cancel_kb(), parse_mode="HTML")
+    await state.set_state(AdminReportState.location)
+
+@dp.message(AdminReportState.location, F.text)
+async def admin_report_location(message: types.Message, state: FSMContext):
+    await state.update_data(location=message.text)
+    await message.answer("📸 Отправьте фото инцидента.")
+    await state.set_state(AdminReportState.photo)
+
+@dp.message(AdminReportState.photo, F.photo)
+async def admin_report_photo(message: types.Message, state: FSMContext):
+    data     = await state.get_data()
+    photo_id = message.photo[-1].file_id
+    location = data["location"]
+    report_id = db.create_report(message.from_user.id, location, photo_id)
+    db.update_report_status(report_id, "approved")
+    await message.answer(
+        f"✅ Репорт <b>#{report_id}</b> создан и автоматически одобрен.\n"
+        f"📍 Локация: <code>{location}</code>",
+        reply_markup=get_superadmin_kb(), parse_mode="HTML")
     await state.clear()
-    await message.answer(
-        f"📋 Репорт *#{r_id}* отклонён.\nПричина: _{reason}_",
-        parse_mode="Markdown"
-    )
-    if driver_id:
-        await bot.send_message(
-            driver_id,
-            f"❌ Ваш репорт *#{r_id}* был отклонён.\n"
-            f"📝 Причина: _{reason}_",
-            parse_mode="Markdown"
-        )
+
+@dp.message(AdminReportState.photo)
+async def admin_report_photo_wrong(message: types.Message):
+    await message.answer("⚠️ Отправьте именно фото.")
 
 # ==========================================
-# АДМИН — рассылка
+# СУПЕРАДМИН: рассылка
 # ==========================================
-@dp.message(F.text == "📢 Рассылка водителям")
-async def broadcast_drivers_start(message: types.Message, state: FSMContext):
-    if message.from_user.id != SUPER_ADMIN_ID:
-        return
-    await state.update_data(target="drivers")
+@dp.message(F.text == "📢 Рассылка")
+async def broadcast_start(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id): return
     await message.answer(
-        "✏️ Введите текст рассылки для *водителей*:",
-        reply_markup=ReplyKeyboardRemove(), parse_mode="Markdown"
-    )
+        "📢 Введите текст рассылки.\nОн будет отправлен *всем* одобренным пользователям.",
+        reply_markup=get_cancel_kb(), parse_mode="Markdown")
     await state.set_state(BroadcastState.text)
 
-@dp.message(F.text == "📣 Рассылка пассажирам")
-async def broadcast_passengers_start(message: types.Message, state: FSMContext):
-    if message.from_user.id != SUPER_ADMIN_ID:
-        return
-    await state.update_data(target="passengers")
-    await message.answer(
-        "✏️ Введите текст рассылки для *пассажиров*:",
-        reply_markup=ReplyKeyboardRemove(), parse_mode="Markdown"
-    )
-    await state.set_state(BroadcastState.text)
-
-@dp.message(BroadcastState.text)
+@dp.message(BroadcastState.text, F.text)
 async def broadcast_send(message: types.Message, state: FSMContext):
-    data   = await state.get_data()
-    target = data.get('target', 'drivers')
-    text   = message.text.strip()
     await state.clear()
-
-    recipients = db.get_all_drivers() if target == 'drivers' else db.get_all_passengers()
-    role_label = "водителям" if target == 'drivers' else "пассажирам"
-
+    users = db.get_all_approved()
+    text  = f"📢 *Сообщение от администратора CTS:*\n\n{message.text}"
     sent, failed = 0, 0
-    for (uid,) in recipients:
-        if uid == SUPER_ADMIN_ID:
-            continue
+    for (uid,) in users:
+        if uid == SUPER_ADMIN_ID: continue
         try:
-            await bot.send_message(
-                uid,
-                f"📢 *Оповещение от администратора CTS:*\n\n{text}",
-                parse_mode="Markdown"
-            )
+            await bot.send_message(uid, text, parse_mode="Markdown")
             sent += 1
         except Exception:
             failed += 1
-
     await message.answer(
-        f"✅ Рассылка {role_label} завершена.\n"
-        f"📨 Отправлено: *{sent}* | ❌ Не доставлено: *{failed}*",
-        reply_markup=kb_admin(), parse_mode="Markdown"
-    )
+        f"✅ Рассылка завершена.\n📨 Отправлено: {sent}\n❌ Не доставлено: {failed}",
+        reply_markup=get_superadmin_kb())
+
+# ==========================================
+# СУПЕРАДМИН: дрон-аудит
+# ==========================================
+@dp.message(F.text == "🚁 Дрон-аудит")
+async def drone_start(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id): return
+    await message.answer(
+        "🚁 Введите локацию для дрон-аудита.\n"
+        "Координаты (напр. <code>51.1283, 71.4305</code>) или описание.",
+        reply_markup=get_cancel_kb(), parse_mode="HTML")
+    await state.set_state(DroneState.location)
+
+@dp.message(DroneState.location, F.text)
+async def drone_submit(message: types.Message, state: FSMContext):
+    location  = message.text
+    audit_id  = db.create_drone_audit(location, message.from_user.id)
+    await state.clear()
+    await message.answer(
+        f"🚁 Дрон-аудит <b>#{audit_id}</b> запрошен.\n"
+        f"📍 Локация: <code>{location}</code>\n\n"
+        f"Статус: ⏳ Ожидает назначения оператора.",
+        reply_markup=get_superadmin_kb(), parse_mode="HTML")
+
+# ==========================================
+# ВОДИТЕЛЬ: репорт (с вводом локации)
+# ==========================================
+@dp.message(F.text == "🚨 Сообщить об инциденте")
+async def driver_report_start(message: types.Message, state: FSMContext):
+    user = db.get_user(message.from_user.id)
+    if not (is_admin(message.from_user.id) or
+            (user and user[2] == 'approved' and user[1] == 'driver')):
+        await message.answer("⛔ У вас нет доступа."); return
+    await message.answer(
+        "📍 Введите локацию инцидента\n(адрес или координаты):",
+        reply_markup=get_cancel_kb())
+    await state.set_state(ReportState.location)
+
+@dp.message(ReportState.location, F.text)
+async def driver_report_location(message: types.Message, state: FSMContext):
+    await state.update_data(location=message.text)
+    await message.answer("📸 Теперь отправьте фото инцидента.", reply_markup=ReplyKeyboardRemove())
+    await state.set_state(ReportState.photo)
+
+@dp.message(ReportState.photo, F.photo)
+async def driver_report_photo(message: types.Message, state: FSMContext):
+    data      = await state.get_data()
+    photo_id  = message.photo[-1].file_id
+    location  = data["location"]
+    uid       = message.from_user.id
+    report_id = db.create_report(uid, location, photo_id)
+    kb = get_superadmin_kb() if is_admin(uid) else get_driver_kb()
+    await message.answer(f"✅ Репорт #{report_id} отправлен на проверку.", reply_markup=kb)
+    await state.clear()
+    # Уведомить суперадмина
+    if not is_admin(uid):
+        user = db.get_user(uid)
+        name = user[3] if user else str(uid)
+        await bot.send_photo(SUPER_ADMIN_ID, photo=photo_id,
+            caption=f"🔔 Новый репорт #{report_id}\n👤 {name}\n📍 {location}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="✅ Одобрить", callback_data=f"adm_ok_{report_id}"),
+                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"adm_no_{report_id}")
+            ]]))
+
+@dp.message(ReportState.photo)
+async def driver_report_photo_wrong(message: types.Message):
+    await message.answer("⚠️ Отправьте именно фото.")
+
+# ==========================================
+# БОНУСЫ
+# ==========================================
+@dp.message(F.text == "🎁 Мои бонусы")
+async def check_bonus(message: types.Message):
+    res = db.cursor.execute("SELECT points FROM users WHERE user_id=?", (message.from_user.id,)).fetchone()
+    pts  = res[0] if res else 0
+    days = pts // 4
+    left = 4 - (pts % 4) if pts % 4 != 0 else 0
+    text = f"⭐ Ваши баллы: *{pts}*\n📅 Дней отдыха: *{days}*"
+    if left:
+        text += f"\n\nДо следующего дня отдыха: ещё *{left}* репорта."
+    await message.answer(text, parse_mode="Markdown")
 
 # ==========================================
 # ЗАПУСК
 # ==========================================
 async def main():
-    logging.info("CTS Driver Network Bot запущен.")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
